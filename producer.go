@@ -1,4 +1,4 @@
-package llib_kafka
+package llibkafka
 
 import "github.com/Shopify/sarama"
 
@@ -16,6 +16,7 @@ func NewProducer(ops ...ProducerOption) (*Producer, error) {
 		ackType:               sarama.WaitForAll,           // 发送完数据需要leader和follow都确认
 		partitionerChoiceFunc: sarama.NewRandomPartitioner, // 新选出一个partition
 		successChannelReturn:  true,                        // 成功交付的消息将在success channel返回
+		errorChannelReturn:    true,                        // 失败的消息将在error channel返回
 	}
 
 	for _, o := range ops {
@@ -27,6 +28,7 @@ func NewProducer(ops ...ProducerOption) (*Producer, error) {
 	opts.sCfg.Producer.RequiredAcks = opts.ackType
 	opts.sCfg.Producer.Partitioner = opts.partitionerChoiceFunc
 	opts.sCfg.Producer.Return.Successes = opts.successChannelReturn
+	opts.sCfg.Producer.Return.Errors = opts.errorChannelReturn
 
 	return &Producer{
 		Opts: opts,
@@ -54,6 +56,7 @@ func (p *Producer) Start() error {
 		}
 	}
 	if err != nil {
+		logErrorf("Producer start failed: %v", err)
 		return err
 	}
 	p.SP = sp
@@ -61,20 +64,27 @@ func (p *Producer) Start() error {
 	return nil
 }
 
-func (p *Producer) SendMessage(bodyStr string) error {
-	return p.SendMessageToTopic(p.Opts.sendTopic, bodyStr)
+func (p *Producer) SendMessage(msg *Message) error {
+	return p.SendMessageToTopic(p.Opts.sendTopic, msg)
 }
-func (p *Producer) SendMessageToTopic(topic, bodyStr string) error {
-	msg := &sarama.ProducerMessage{}
-	msg.Topic = topic
-	msg.Value = sarama.StringEncoder(bodyStr)
+func (p *Producer) SendMessageToTopic(topic string, msg *Message) error {
+	sMsg := &sarama.ProducerMessage{}
+	sMsg.Topic = topic
+	sMsg.Headers = make([]sarama.RecordHeader, 0)
+	for k, v := range msg.Headers {
+		sMsg.Headers = append(sMsg.Headers, sarama.RecordHeader{
+			Key:   []byte(k),
+			Value: []byte(v),
+		})
+	}
+	sMsg.Value = sarama.StringEncoder(msg.Body)
 
 	if p.SP != nil {
-		_, _, err := p.SP.SendMessage(msg)
+		_, _, err := p.SP.SendMessage(sMsg)
 		return err
 	}
 	if p.ASP != nil {
-		p.ASP.Input() <- msg
+		p.ASP.Input() <- sMsg
 	}
 	return nil
 }

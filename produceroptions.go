@@ -1,4 +1,4 @@
-package llib_kafka
+package llibkafka
 
 import "github.com/Shopify/sarama"
 
@@ -9,6 +9,7 @@ type ProducerOptions struct {
 	ackType               sarama.RequiredAcks
 	partitionerChoiceFunc func(topic string) sarama.Partitioner
 	successChannelReturn  bool // 成功交付的消息将在success channel返回
+	errorChannelReturn    bool // 失败的消息将在error channel返回
 }
 
 type ProducerOption func(options *ProducerOptions) error

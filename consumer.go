@@ -1,7 +1,7 @@
-package llib_kafka
+package llibkafka
 
 import (
-	"fmt"
+	"errors"
 	"github.com/Shopify/sarama"
 )
 
@@ -9,6 +9,7 @@ type Consumer struct {
 	Opts               *KafkaOptions
 	C                  sarama.Consumer
 	PartitionConsumers map[string][]sarama.PartitionConsumer
+	closing            chan struct{}
 }
 
 func NewConsumer(co ...KafkaOption) (*Consumer, error) {
@@ -17,11 +18,16 @@ func NewConsumer(co ...KafkaOption) (*Consumer, error) {
 		err error
 	)
 	opts := &KafkaOptions{
-		sCfg: sarama.NewConfig(),
+		sCfg:    sarama.NewConfig(),
+		autoAck: false,
 	}
-
 	for _, o := range co {
 		o(opts)
+	}
+	opts.sCfg.Consumer.Return.Errors = true
+	opts.sCfg.Consumer.Offsets.Initial = sarama.OffsetNewest
+	if opts.consumeFromBeginning {
+		opts.sCfg.Consumer.Offsets.Initial = sarama.OffsetOldest
 	}
 
 	if opts.cli != nil {
@@ -37,6 +43,7 @@ func NewConsumer(co ...KafkaOption) (*Consumer, error) {
 		Opts:               opts,
 		C:                  c,
 		PartitionConsumers: make(map[string][]sarama.PartitionConsumer),
+		closing:            make(chan struct{}),
 	}, nil
 }
 
@@ -45,9 +52,12 @@ func (c *Consumer) GetAllPartitions(topic string) ([]int32, error) {
 	return c.C.Partitions(topic)
 }
 
-type ConsumeExecFunc func(msg *sarama.ConsumerMessage)
+func (c *Consumer) StartListen(consumeHandler ConsumeHandler, errHandler ConsumeErrHandler) error {
+	topic := c.Opts.topic
+	if len(topic) == 0 {
+		return errors.New("topic is empty")
+	}
 
-func (c *Consumer) StartListen(topic string, execFunc ConsumeExecFunc) error {
 	pList, err := c.GetAllPartitions(topic)
 	if err != nil {
 		return err
@@ -60,56 +70,59 @@ func (c *Consumer) StartListen(topic string, execFunc ConsumeExecFunc) error {
 		// 针对每个分区创建一个对应的分区消费者
 		pc, err := c.C.ConsumePartition(topic, int32(partition), sarama.OffsetNewest)
 		if err != nil {
-			fmt.Printf("failed to start consumer for partition %d,err:%v\n", partition, err)
+			logErrorf("failed to start consumer for partition %d,err:%v\n", partition, err)
 			return err
 		}
 		c.PartitionConsumers[topic] = append(c.PartitionConsumers[topic], pc)
 
+		go func(pc sarama.PartitionConsumer) {
+			<-c.closing
+			pc.AsyncClose()
+		}(pc)
+
 		go func(consumer sarama.PartitionConsumer) {
 			for msg := range consumer.Messages() {
-				execFunc(msg)
+				c.handleMessage(msg, topic, consumeHandler, errHandler)
 			}
 		}(pc)
-		//for msg := range pc.Messages() {
-		//	execFunc(msg)
-		//}
 	}
 	return nil
 }
 
-func Consume() {
-	consumer, err := sarama.NewConsumer([]string{"127.0.0.1:9092"}, nil)
-	if err != nil {
-		fmt.Printf("kafka connnet failed, error[%v]", err.Error())
-		return
-	}
-	//defer consumer.Close()
+func (c *Consumer) handleMessage(msg *sarama.ConsumerMessage, topic string, consumeHandler ConsumeHandler, errHandler ConsumeErrHandler) {
+	logDebugf("Message claimed: value = %s, timestamp = %v, topic = %s",
+		string(msg.Value), msg.Timestamp, msg.Topic)
 
-	partitions, err := consumer.Partitions("first_kafka_topic")
-	if err != nil {
-		fmt.Printf("get topic failed, error[%v]", err.Error())
-		return
+	headers := make(map[string]string, len(msg.Headers))
+	for _, val := range msg.Headers {
+		headers[string(val.Key)] = string(val.Value)
 	}
-	for _, p := range partitions {
-		partitionConsumer, err := consumer.ConsumePartition("first_kafka_topic", p, sarama.OffsetNewest)
-		if err != nil {
-			fmt.Printf("get partition consumer failed, error[%v]", err.Error())
-			continue
+
+	m := &Message{
+		Topic:       topic,
+		Partition:   msg.Partition,
+		Offset:      msg.Offset,
+		ConsumerKey: "",
+		Headers:     headers,
+		Body:        msg.Value,
+	}
+
+	err := consumeHandler(m)
+	if err == nil && c.Opts.autoAck {
+
+	} else if err != nil {
+		if errHandler != nil {
+			errHandler(m, err)
+		} else {
+			logErrorf("[kafka]: subscriber error: %v", err)
 		}
-		go func(pc sarama.PartitionConsumer) {
-			for message := range pc.Messages() {
-				fmt.Printf("message:[%v], key:[%v], offset:[%v]\n", string(message.Value), string(message.Key), string(message.Offset))
-				//this.MessageQueue <- string(message.Value)
-			}
-		}(partitionConsumer)
 	}
 }
 
-func (c *Consumer) StopAllListen() error {
-	for _, pcList := range c.PartitionConsumers {
-		for i, _ := range pcList {
-			pcList[i].AsyncClose()
-		}
+func (c *Consumer) Stop() error {
+	if c.closing != nil {
+		close(c.closing)
+		c.closing = nil
 	}
 	return nil
 }
